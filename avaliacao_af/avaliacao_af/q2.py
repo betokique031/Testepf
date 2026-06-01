@@ -1,179 +1,173 @@
 import rclpy
 import numpy as np
 from rclpy.node import Node
+from rclpy.qos import ReliabilityPolicy, QoSProfile
 from geometry_msgs.msg import Twist
+from sensor_msgs.msg import LaserScan
 from robcomp_util.odom import Odom
-from robcomp_util.laser import Laser
 
 
-class MedirCaixa(Node, Odom, Laser):
+class MedirCaixa(Node, Odom):
     """
     Exercicio 2 - AF 24b.
-    Navega ate a caixa, contorna mantendo-a a ESQUERDA usando o laser,
-    mede largura e comprimento (odometria entre os cantos) e volta ao
-    ponto de partida. A funcao control() eh a unica a publicar /cmd_vel.
-
-    Ideia da medida: contornando o retangulo a uma distancia fixa `d`,
-    os trechos RETOS da trajetoria tem o mesmo comprimento das faces da
-    caixa (os cantos viram arcos). Mede-se o trecho reto entre dois cantos
-    via odometria. Cantos = quando o laser da esquerda "abre" (some a face).
+    Acha a caixa pelo laser, ORBITA ela mantendo-a a esquerda a uma
+    distancia fixa e acumula os pontos do laser. A medida e a extensao
+    dos pontos (max - min), entao nao depende de onde a odometria comecou:
+        largura     = max(x) - min(x)
+        comprimento = max(y) - min(y)
+    Depois volta ao ponto de partida. control() e a unica que publica /cmd_vel.
     """
 
     def __init__(self):
         super().__init__('medidor_node')
         Odom.__init__(self)
-        Laser.__init__(self)
         rclpy.spin_once(self)
 
-        self.robot_state = 'procurar'
+        self.robot_state = 'aproximar'
         self.state_machine = {
-            'procurar':  self.procurar,
             'aproximar': self.aproximar,
-            'encostar':  self.encostar,
-            'contornar': self.contornar,
+            'orbitar':   self.orbitar,
             'retornar':  self.retornar,
             'stop':      self.stop,
             'done':      self.done,
         }
 
-        # ---- Parametros (AJUSTE NA PROVA) ----
-        self.d = 0.45          # m: distancia que mantem da caixa
-        self.v = 0.15          # m/s: velocidade ao contornar
-        self.kp_ang = 1.5      # ganho do controle lateral (laser esquerda)
-        self.abre_corner = 0.6 # m: variacao na esquerda que indica canto (face acabou)
-        self.tol_front = 0.1   # m: folga para detectar parede a frente
+        # ===== AJUSTES RAPIDOS =====
+        self.D = 0.7          # m: distancia que mantem da caixa
+        self.v = 0.12         # m/s: velocidade
+        self.kb = 0.8         # ganho pra manter a caixa a 90 graus (esquerda)
+        self.kd = 1.5         # ganho pra manter a distancia D
+        # ===========================
 
-        # ---- Estado interno ----
         self.twist = Twist()
-        self.x0 = self.x       # ponto de partida
-        self.y0 = self.y
-        self.cantos = 0
-        self.seg_inicio = None             # (x,y) do inicio do trecho reto atual
-        self.medidas = []                  # comprimentos dos trechos retos
-        self.esq_anterior = None
+        self.x0, self.y0 = self.x, self.y
 
+        self.ranges = None
+        self.angle_min = 0.0
+        self.angle_inc = 0.0
+        self.range_max = 3.5
+
+        self.xs = []
+        self.ys = []
+
+        self.ox = self.oy = None
+        self.afastou = False
+
+        self.create_subscription(
+            LaserScan, '/scan', self.scan_callback,
+            QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT))
         self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
         self.timer = self.create_timer(0.1, self.control)
 
+    # ================= CALLBACK =================
+    def scan_callback(self, msg):
+        self.ranges = msg.ranges
+        self.angle_min = msg.angle_min
+        self.angle_inc = msg.angle_increment
+        self.range_max = msg.range_max
+
     # ================= HELPERS =================
-    def front_min(self):
-        vals = [x for x in self.front if np.isfinite(x)]
-        return min(vals) if vals else np.inf
+    def ajuste(self, a):
+        return np.arctan2(np.sin(a), np.cos(a))
 
-    def esq_min(self):
-        vals = [x for x in self.left if np.isfinite(x)]
-        return min(vals) if vals else np.inf
+    def pronto(self):
+        return self.ranges is not None
 
-    def idx_mais_perto(self):
-        """Indice (graus) da menor leitura do laser -> direcao da caixa."""
-        arr = np.array([x if np.isfinite(x) else 1e6 for x in self.laser_msg])
-        return int(np.argmin(arr))
+    def feixes(self):
+        lim = 3.4   # alcance util do LDS (~3.5 m); nao depende do range_max reportado
+        for i, r in enumerate(self.ranges):
+            if np.isfinite(r) and 0.05 < r < lim:
+                yield self.ajuste(self.angle_min + i * self.angle_inc), r
 
-    def dist_de(self, x, y):
-        return np.hypot(self.x - x, self.y - y)
+    def ponto_mais_proximo(self):
+        """(angulo_no_robo, distancia) do ponto mais perto = caixa. (None, inf) se nao ve."""
+        melhor_a, melhor_r = None, np.inf
+        for ang, r in self.feixes():
+            if r < melhor_r:
+                melhor_r, melhor_a = r, ang
+        return melhor_a, melhor_r
+
+    def coleta(self):
+        for ang, r in self.feixes():
+            a = self.yaw + ang
+            self.xs.append(self.x + r * np.cos(a))
+            self.ys.append(self.y + r * np.sin(a))
+
+    def vai_para(self, tx, ty):
+        dx, dy = tx - self.x, ty - self.y
+        if np.hypot(dx, dy) < 0.2:
+            return True
+        erro = self.ajuste(np.arctan2(dy, dx) - self.yaw)
+        self.twist.linear.x = 0.0 if abs(erro) > 0.4 else self.v
+        self.twist.angular.z = float(np.clip(1.0 * erro, -0.8, 0.8))
+        return False
+
+    def reporta(self):
+        if len(self.xs) < 10:
+            self.get_logger().warn('poucos pontos para medir a caixa')
+            return
+        xs = np.array(self.xs)
+        ys = np.array(self.ys)
+        # percentis 1 e 99 descartam pontos espurios (1 feixe perdido nao estraga a medida)
+        x_lo, x_hi = np.percentile(xs, 1), np.percentile(xs, 99)
+        y_lo, y_hi = np.percentile(ys, 1), np.percentile(ys, 99)
+        largura = x_hi - x_lo
+        comprimento = y_hi - y_lo
+        self.get_logger().info(
+            f'>>> CAIXA: largura (X) ~ {largura:.2f} m | comprimento (Y) ~ {comprimento:.2f} m')
+        self.get_logger().info(
+            f'    [debug] pontos={len(xs)} x=[{x_lo:.2f},{x_hi:.2f}] y=[{y_lo:.2f},{y_hi:.2f}]')
 
     # ================= ESTADOS =================
-    def procurar(self):
-        """Gira ate ficar de frente para a caixa (menor leitura ~ 0 graus)."""
-        rclpy.spin_once(self, timeout_sec=0.1)
-        idx = self.idx_mais_perto()
-        ang = idx if idx <= 180 else idx - 360   # graus, [-180,180]
-        if abs(ang) < 5:
-            self.twist = Twist()
-            self.robot_state = 'aproximar'
-        else:
-            self.twist.angular.z = 0.3 * np.sign(ang)
-
     def aproximar(self):
-        """Anda em direcao a caixa ate ficar a `d` dela."""
-        rclpy.spin_once(self, timeout_sec=0.1)
-        idx = self.idx_mais_perto()
-        ang = idx if idx <= 180 else idx - 360
-        if self.front_min() <= self.d:
-            self.twist = Twist()
-            self.robot_state = 'encostar'
-        else:
-            self.twist.linear.x = self.v
-            self.twist.angular.z = 0.01 * ang   # corrige para apontar pra caixa
-
-    def encostar(self):
-        """Gira 90 graus para a direita -> caixa fica na esquerda do robo."""
-        rclpy.spin_once(self, timeout_sec=0.1)
-        if not hasattr(self, 'goal_yaw_enc'):
-            self.goal_yaw_enc = np.arctan2(
-                np.sin(self.yaw - np.pi / 2), np.cos(self.yaw - np.pi / 2))
-        erro = np.arctan2(np.sin(self.goal_yaw_enc - self.yaw),
-                          np.cos(self.goal_yaw_enc - self.yaw))
-        if abs(erro) < np.deg2rad(5):
-            self.twist = Twist()
-            self.seg_inicio = (self.x, self.y)
-            self.esq_anterior = self.esq_min()
-            self.robot_state = 'contornar'
-        else:
-            self.twist.angular.z = 0.5 * erro
-
-    def contornar(self):
-        """Segue a caixa pela esquerda. Conta cantos e mede os trechos retos."""
-        rclpy.spin_once(self, timeout_sec=0.1)
-        esq = self.esq_min()
-        frente = self.front_min()
-
-        # parede a frente (canto interno) -> gira para a direita, sem andar
-        if frente < self.d + self.tol_front:
-            self.twist.linear.x = 0.0
-            self.twist.angular.z = -0.4
+        """Anda em direcao a caixa (sempre pra frente) ate ficar a D dela."""
+        if not self.pronto():
             return
-
-        # face acabou (a esquerda "abriu") -> e um canto da caixa
-        if self.esq_anterior is not None and (esq - self.esq_anterior) > self.abre_corner:
-            comp = self.dist_de(*self.seg_inicio)
-            self.medidas.append(comp)
-            self.cantos += 1
-            self.get_logger().info(
-                f'Canto {self.cantos}: trecho medido = {comp:.2f} m')
-            self.seg_inicio = (self.x, self.y)
-            # contornou 4 faces -> terminou
-            if self.cantos >= 4:
-                self.reporta_medidas()
-                self.robot_state = 'retornar'
-                return
-            # arco para a esquerda para envolver o canto
-            self.twist.linear.x = self.v
-            self.twist.angular.z = 0.6
-            self.esq_anterior = esq
+        ang, dist = self.ponto_mais_proximo()
+        if ang is None:                          # nao ve a caixa -> diagnostica e procura
+            finitos = [r for r in self.ranges if np.isfinite(r) and 0.05 < r < 3.4]
+            if finitos:
+                self.get_logger().warn(
+                    f'caixa fora do filtro? leituras_uteis={len(finitos)} min={min(finitos):.2f}')
+            else:
+                self.get_logger().warn(
+                    'NENHUMA leitura util do laser (caixa nao spawnou, robo em cima dela, ou fora de alcance)')
+            self.twist.angular.z = 0.4
             return
+        if dist <= self.D:                       # chegou perto -> comeca a orbitar
+            self.ox, self.oy = self.x, self.y
+            self.afastou = False
+            self.robot_state = 'orbitar'
+            return
+        self.twist.linear.x = self.v             # SEMPRE anda pra frente
+        self.twist.angular.z = float(np.clip(1.0 * ang, -0.6, 0.6))
 
-        # segue reto controlando a distancia lateral (mantem caixa a `d`)
-        erro = esq - self.d
-        self.twist.linear.x = self.v
-        self.twist.angular.z = float(np.clip(self.kp_ang * erro, -0.5, 0.5))
-        self.esq_anterior = esq
+    def orbitar(self):
+        """Orbita mantendo a caixa a ~90 graus (esquerda) e a distancia D."""
+        if not self.pronto():
+            return
+        self.coleta()
+        beta, rho = self.ponto_mais_proximo()
 
-    def reporta_medidas(self):
-        if len(self.medidas) >= 4:
-            largura = (self.medidas[0] + self.medidas[2]) / 2
-            comprimento = (self.medidas[1] + self.medidas[3]) / 2
+        if beta is None:                         # perdeu a caixa -> curva pra esquerda procurando
+            self.twist.linear.x = self.v
+            self.twist.angular.z = 0.4
         else:
-            largura = self.medidas[0] if self.medidas else 0.0
-            comprimento = self.medidas[1] if len(self.medidas) > 1 else 0.0
-        self.get_logger().info(
-            f'>>> CAIXA: largura ~ {largura:.2f} m | comprimento ~ {comprimento:.2f} m')
+            ang = self.kb * (beta - np.pi / 2) + self.kd * (rho - self.D)
+            self.twist.linear.x = self.v
+            self.twist.angular.z = float(np.clip(ang, -0.8, 0.8))
+
+        # terminou a volta? (afastou do inicio e voltou)
+        d = np.hypot(self.x - self.ox, self.y - self.oy)
+        if d > 0.8:
+            self.afastou = True
+        if self.afastou and d < 0.3:
+            self.reporta()
+            self.robot_state = 'retornar'
 
     def retornar(self):
-        """Volta ao ponto de partida (go-to-point por odometria)."""
-        rclpy.spin_once(self, timeout_sec=0.1)
-        if self.dist_de(self.x0, self.y0) < 0.2:
-            self.twist = Twist()
+        if self.vai_para(self.x0, self.y0):
             self.robot_state = 'stop'
-            return
-        ang_alvo = np.arctan2(self.y0 - self.y, self.x0 - self.x)
-        erro = np.arctan2(np.sin(ang_alvo - self.yaw), np.cos(ang_alvo - self.yaw))
-        if abs(erro) > np.deg2rad(15):
-            self.twist.linear.x = 0.0
-            self.twist.angular.z = 0.5 * erro
-        else:
-            self.twist.linear.x = self.v
-            self.twist.angular.z = 0.5 * erro
 
     def stop(self):
         self.twist = Twist()
